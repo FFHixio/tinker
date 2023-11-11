@@ -22,19 +22,22 @@ import static com.tencent.tinker.loader.shareutil.ShareReflectUtil.findConstruct
 import static com.tencent.tinker.loader.shareutil.ShareReflectUtil.findField;
 import static com.tencent.tinker.loader.shareutil.ShareReflectUtil.findMethod;
 
-import android.app.Application;
 import android.content.Context;
 import android.content.pm.ApplicationInfo;
 import android.content.res.AssetManager;
 import android.content.res.Resources;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Message;
 import android.util.ArrayMap;
 
 import com.tencent.tinker.loader.shareutil.ShareConstants;
 import com.tencent.tinker.loader.shareutil.SharePatchFileUtil;
 import com.tencent.tinker.loader.shareutil.ShareReflectUtil;
+import com.tencent.tinker.loader.shareutil.ShareTinkerInternals;
 import com.tencent.tinker.loader.shareutil.ShareTinkerLog;
 
+import java.io.File;
 import java.io.InputStream;
 import java.lang.ref.WeakReference;
 import java.lang.reflect.Constructor;
@@ -42,6 +45,7 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -57,6 +61,7 @@ class TinkerResourcePatcher {
 
     private static Map<Object, WeakReference<Object>> resourceImpls = null;
     private static Object currentActivityThread = null;
+    private static AssetManager newAssetManager = null;
 
     // method
     private static Constructor<?> newAssetManagerCtor = null;
@@ -66,11 +71,8 @@ class TinkerResourcePatcher {
 
     // field
     private static Field assetsFiled = null;
-    private static Field resourcesImplField = null;
+    private static Field resourcesImplFiled = null;
     private static Field resDir = null;
-    private static Field resources = null;
-    private static Field application = null;
-    private static Field classloader = null;
     private static Field packagesFiled = null;
     private static Field resourcePackagesFiled = null;
     private static Field publicSourceDirField = null;
@@ -101,9 +103,6 @@ class TinkerResourcePatcher {
         }
 
         resDir = findField(loadedApkClass, "mResDir");
-        resources = findField(loadedApkClass, "mResources");
-        application = findField(loadedApkClass, "mApplication");
-        classloader = findField(loadedApkClass, "mClassLoader");
         packagesFiled = findField(activityThread, "mPackages");
         try {
             resourcePackagesFiled = findField(activityThread, "mResourcePackages");
@@ -175,7 +174,7 @@ class TinkerResourcePatcher {
         if (SDK_INT >= 24) {
             try {
                 // N moved the mAssets inside an mResourcesImpl field
-                resourcesImplField = findField(resources, "mResourcesImpl");
+                resourcesImplFiled = findField(resources, "mResourcesImpl");
             } catch (Throwable ignore) {
                 // for safety
                 assetsFiled = findField(resources, "mAssets");
@@ -192,32 +191,20 @@ class TinkerResourcePatcher {
     }
 
     /**
-     * @param app
+     * @param context
      * @param externalResourceFile
      * @throws Throwable
      */
-    @SuppressWarnings({"ConstantConditions", "unchecked"})
-    public static void monkeyPatchExistingResources(Application app, String externalResourceFile, boolean isReInject) throws Throwable {
+    public static void monkeyPatchExistingResources(Context context, String externalResourceFile, boolean isReInject) throws Throwable {
         if (externalResourceFile == null) {
             return;
         }
 
-        final ApplicationInfo appInfo = app.getApplicationInfo();
+        final ApplicationInfo appInfo = context.getApplicationInfo();
 
-        // Ensure mPackages and mResourcePackages cache contains LoadedApk instance related to this app.
-        packageContext = app.createPackageContext(app.getPackageName(), Context.CONTEXT_INCLUDE_CODE);
-        packageResContext = app.createPackageContext(app.getPackageName(), 0);
-
-        final Resources oldResources = packageResContext.getResources();
-        Field implAssetsField = null;
-        Object appAssetManager = null;
-        if (resourcesImplField != null) {
-            final Object appResourcesImpl = resourcesImplField.get(oldResources);
-            implAssetsField = findField(appResourcesImpl, "mAssets");
-            appAssetManager = implAssetsField.get(appResourcesImpl);
-        } else {
-            appAssetManager = assetsFiled.get(oldResources);
-        }
+        // Prevent cached LoadedApk being recycled.
+        packageContext = context.createPackageContext(context.getPackageName(), Context.CONTEXT_INCLUDE_CODE);
+        packageResContext = context.createPackageContext(context.getPackageName(), 0);
 
         final Field[] packagesFields = new Field[]{packagesFiled, resourcePackagesFiled};
         for (Field field : packagesFields) {
@@ -235,29 +222,35 @@ class TinkerResourcePatcher {
                 final String resDirPath = (String) resDir.get(loadedApk);
                 if (appInfo.sourceDir.equals(resDirPath)) {
                     resDir.set(loadedApk, externalResourceFile);
-                    if (isReInject) {
-                        application.set(loadedApk, app);
-                        classloader.set(loadedApk, SystemClassLoaderAdder.getInjectedClassLoader());
-                    }
-                    resources.set(loadedApk, null);
                 }
             }
         }
 
-        // Let modified resDir take effect and use it to create new Context instance.
-        packageContext = app.createPackageContext(app.getPackageName(), Context.CONTEXT_INCLUDE_CODE);
-        packageResContext = app.createPackageContext(app.getPackageName(), 0);
-        PatchedResourcesInsuranceLogic.recordCurrentPatchedResModifiedTime(externalResourceFile);
+        if (isReInject) {
+            ShareTinkerLog.i(TAG, "Re-injecting, skip rest logic.");
+            recordCurrentPatchedResModifiedTime(externalResourceFile);
+            return;
+        }
 
-        final Resources newResources = packageResContext.getResources();
-        Object newAssetManager = null;
-        if (resourcesImplField != null) {
-            // N
-            final Object resourceImpl = resourcesImplField.get(newResources);
-            newAssetManager = implAssetsField.get(resourceImpl);
-        } else {
-            //pre-N
-            newAssetManager = assetsFiled.get(newResources);
+        newAssetManager = (AssetManager) newAssetManagerCtor.newInstance();
+        // Create a new AssetManager instance and point it to the resources installed under
+        if (((Integer) addAssetPathMethod.invoke(newAssetManager, externalResourceFile)) == 0) {
+            throw new IllegalStateException("Could not create new AssetManager");
+        }
+        recordCurrentPatchedResModifiedTime(externalResourceFile);
+
+        // Add SharedLibraries to AssetManager for resolve system resources not found issue
+        // This influence SharedLibrary Package ID
+        if (shouldAddSharedLibraryAssets(appInfo)) {
+            for (String sharedLibrary : appInfo.sharedLibraryFiles) {
+                if (!sharedLibrary.endsWith(".apk")) {
+                    continue;
+                }
+                if (((Integer) addAssetPathAsSharedLibraryMethod.invoke(newAssetManager, sharedLibrary)) == 0) {
+                    throw new IllegalStateException("AssetManager add SharedLibrary Fail");
+                }
+                ShareTinkerLog.i(TAG, "addAssetPathAsSharedLibrary " + sharedLibrary);
+            }
         }
 
         // Kitkat needs this method call, Lollipop doesn't. However, it doesn't seem to cause any harm
@@ -273,44 +266,34 @@ class TinkerResourcePatcher {
                 continue;
             }
             // Set the AssetManager of the Resources instance to our brand new one
-            if (resourcesImplField != null) {
-                // N
-                final Object resourcesImpl = resourcesImplField.get(resources);
-                final Object assetManager = implAssetsField.get(resourcesImpl);
-                if (assetManager == appAssetManager) {
-                    implAssetsField.set(resourcesImpl, newAssetManager);
-                }
-            } else {
+            try {
                 //pre-N
-                final Object assetManager = assetsFiled.get(resources);
-                if (assetManager == appAssetManager) {
-                    assetsFiled.set(resources, newAssetManager);
-                }
+                assetsFiled.set(resources, newAssetManager);
+            } catch (Throwable ignore) {
+                // N
+                final Object resourceImpl = resourcesImplFiled.get(resources);
+                // for Huawei HwResourcesImpl
+                final Field implAssets = findField(resourceImpl, "mAssets");
+                implAssets.set(resourceImpl, newAssetManager);
             }
 
             clearPreloadTypedArrayIssue(resources);
+
             resources.updateConfiguration(resources.getConfiguration(), resources.getDisplayMetrics());
         }
 
         try {
             if (resourceImpls != null) {
                 for (WeakReference<Object> wr : resourceImpls.values()) {
-                    final Object resourcesImpl = wr.get();
-                    if (resourcesImpl != null) {
-                        final Object assetManager = implAssetsField.get(resourcesImpl);
-                        if (assetManager == appAssetManager) {
-                            implAssetsField.set(resourcesImpl, newAssetManager);
-                        }
+                    final Object resourceImpl = wr.get();
+                    if (resourceImpl != null) {
+                        final Field implAssets = findField(resourceImpl, "mAssets");
+                        implAssets.set(resourceImpl, newAssetManager);
                     }
                 }
             }
         } catch (Throwable ignored) {
             // Ignored.
-        }
-
-        if (isReInject) {
-            ShareTinkerLog.i(TAG, "Re-injecting, skip rest logic.");
-            return;
         }
 
         // Handle issues caused by WebView on Android N.
@@ -320,20 +303,165 @@ class TinkerResourcePatcher {
         if (Build.VERSION.SDK_INT >= 24) {
             try {
                 if (publicSourceDirField != null) {
-                    publicSourceDirField.set(app.getApplicationInfo(), externalResourceFile);
+                    publicSourceDirField.set(context.getApplicationInfo(), externalResourceFile);
                 }
             } catch (Throwable ignore) {
                 // Ignored.
             }
         }
 
-        if (!checkResUpdate(app)) {
+        if (!checkResUpdate(context)) {
             throw new TinkerRuntimeException(ShareConstants.CHECK_RES_INSTALL_FAIL);
         }
 
-        if (!PatchedResourcesInsuranceLogic.install(app, externalResourceFile)) {
-            ShareTinkerLog.w(TAG, "tryLoadPatchFiles:PatchedResourcesInsuranceLogic install fail.");
-            throw new TinkerRuntimeException("fail to install PatchedResourcesInsuranceLogic.");
+        installResourceInsuranceHacks(context, externalResourceFile);
+    }
+
+    private static void installResourceInsuranceHacks(Context context, String patchedResApkPath) {
+        try {
+            final Object activityThread = ShareReflectUtil.getActivityThread(context, null);
+            final Field mHField = ShareReflectUtil.findField(activityThread, "mH");
+            final Handler mH = (Handler) mHField.get(activityThread);
+            final Field mCallbackField = ShareReflectUtil.findField(Handler.class, "mCallback");
+            final Handler.Callback originCallback = (Handler.Callback) mCallbackField.get(mH);
+            if (!(originCallback instanceof ResourceInsuranceHandlerCallback)) {
+                final ResourceInsuranceHandlerCallback hackCallback = new ResourceInsuranceHandlerCallback(
+                        context, patchedResApkPath, originCallback, mH.getClass());
+                mCallbackField.set(mH, hackCallback);
+            } else {
+                ShareTinkerLog.w(TAG, "installResourceInsuranceHacks: already installed, skip rest logic.");
+            }
+        } catch (Throwable thr) {
+            ShareTinkerLog.printErrStackTrace(TAG, thr, "failed to install resource insurance hack.");
+        }
+    }
+
+    private static final class ResourceInsuranceHandlerCallback implements Handler.Callback {
+        private static final String LAUNCH_ACTIVITY_LIFECYCLE_ITEM_CLASSNAME = "android.app.servertransaction.LaunchActivityItem";
+
+        private final Context mContext;
+        private final String mPatchResApkPath;
+        private final Handler.Callback mOriginalCallback;
+
+        private final int LAUNCH_ACTIVITY;
+        private final int RELAUNCH_ACTIVITY;
+        private final int EXECUTE_TRANSACTION;
+
+        private Method mGetCallbacksMethod = null;
+        private boolean mSkipInterceptExecuteTransaction = false;
+
+        ResourceInsuranceHandlerCallback(Context context, String patchResApkPath, Handler.Callback original, Class<?> hClazz) {
+            Context appContext = context.getApplicationContext();
+            mContext = (appContext != null ? appContext : context);
+            mPatchResApkPath = patchResApkPath;
+            mOriginalCallback = original;
+            LAUNCH_ACTIVITY = fetchMessageId(hClazz, "LAUNCH_ACTIVITY", 100);
+            RELAUNCH_ACTIVITY = fetchMessageId(hClazz, "RELAUNCH_ACTIVITY", 126);
+
+            if (ShareTinkerInternals.isNewerOrEqualThanVersion(28, true)) {
+                EXECUTE_TRANSACTION  = fetchMessageId(hClazz, "EXECUTE_TRANSACTION ", 159);
+            } else {
+                EXECUTE_TRANSACTION = -1;
+            }
+        }
+
+        private int fetchMessageId(Class<?> hClazz, String name, int defVal) {
+            int value;
+            try {
+                value = ShareReflectUtil.findField(hClazz, name).getInt(null);
+            } catch (Throwable e) {
+                value = defVal;
+            }
+            return value;
+        }
+
+        @Override
+        public boolean handleMessage(Message msg) {
+            boolean consume = false;
+            if (hackMessage(msg)) {
+                consume = true;
+            } else if (mOriginalCallback != null) {
+                consume = mOriginalCallback.handleMessage(msg);
+            }
+            return consume;
+        }
+
+        @SuppressWarnings("unchecked")
+        private boolean hackMessage(Message msg) {
+            boolean shouldReInjectPatchedResources = false;
+            if (!isPatchedResModifiedAfterLastLoad(mPatchResApkPath)) {
+                shouldReInjectPatchedResources = false;
+            } else {
+                if (msg.what == LAUNCH_ACTIVITY || msg.what == RELAUNCH_ACTIVITY) {
+                    shouldReInjectPatchedResources = true;
+                } else if (msg.what == EXECUTE_TRANSACTION) {
+                    do {
+                        if (mSkipInterceptExecuteTransaction) {
+                            break;
+                        }
+                        final Object transaction = msg.obj;
+                        if (transaction == null) {
+                            ShareTinkerLog.w(TAG, "transaction is null, skip rest insurance logic.");
+                            break;
+                        }
+                        if (mGetCallbacksMethod == null) {
+                            try {
+                                mGetCallbacksMethod = ShareReflectUtil.findMethod(transaction, "getCallbacks");
+                            } catch (Throwable ignored) {
+                                // Ignored.
+                            }
+                        }
+                        if (mGetCallbacksMethod == null) {
+                            ShareTinkerLog.e(TAG, "fail to find getLifecycleStateRequest method, skip rest insurance logic.");
+                            mSkipInterceptExecuteTransaction = true;
+                            break;
+                        }
+                        try {
+                            final List<Object> req = (List<Object>) mGetCallbacksMethod.invoke(transaction);
+                            if (req != null && req.size() > 0) {
+                                final Object cb = req.get(0);
+                                shouldReInjectPatchedResources = cb != null && cb.getClass().getName().equals(LAUNCH_ACTIVITY_LIFECYCLE_ITEM_CLASSNAME);
+                            }
+                        } catch (Throwable ignored) {
+                            ShareTinkerLog.e(TAG, "fail to call getLifecycleStateRequest method, skip rest insurance logic.");
+                        }
+                    } while (false);
+                }
+            }
+            if (shouldReInjectPatchedResources) {
+                try {
+                    monkeyPatchExistingResources(mContext, mPatchResApkPath, true);
+                } catch (Throwable thr) {
+                    ShareTinkerLog.printErrStackTrace(TAG, thr, "fail to ensure patched resources available after it's modified.");
+                }
+            }
+            return false;
+        }
+    }
+
+    private static boolean isPatchedResModifiedAfterLastLoad(String patchedResPath) {
+        long patchedResModifiedTime;
+        try {
+            patchedResModifiedTime = new File(patchedResPath).lastModified();
+        } catch (Throwable thr) {
+            ShareTinkerLog.printErrStackTrace(TAG, thr, "Fail to get patched res modified time.");
+            patchedResModifiedTime = 0L;
+        }
+        if (patchedResModifiedTime == 0) {
+            return false;
+        }
+        if (patchedResModifiedTime == storedPatchedResModifiedTime) {
+            return false;
+        }
+        return true;
+    }
+
+    private static void recordCurrentPatchedResModifiedTime(String patchedResPath) {
+        try {
+            storedPatchedResModifiedTime = new File(patchedResPath).lastModified();
+        } catch (Throwable thr) {
+            ShareTinkerLog.printErrStackTrace(TAG, thr, "Fail to store patched res modified time.");
+            storedPatchedResModifiedTime = 0L;
         }
     }
 
